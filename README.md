@@ -1,1 +1,301 @@
 # Beacon-System-Sample
+
+# BLE距離検知で映像・音声を再生する展示システム（Wi-Fi無し）
+
+以下はそのままコピーして使える **Markdown形式ドキュメント** です。
+（構成概要・機材リスト・配線図・ESP32側コード（Arduino）・PC側コード（Python）・現場運用メモを含む）
+
+---
+
+# 概要
+
+Wi-Fiを使わず、**ESP32 を持ったオブジェクトが展示PCの近傍に入ったら**
+
+* PC側：映像を自動再生
+* オブジェクト（ESP32）側：有線スピーカーで音声を自動再生
+
+を実現するシステムです。PCはBLEでRSSI（電波強度）を監視し閾値を越えたら対象ESP32へGATT書き込み（`PLAY`）を送り、ESP32は受信したらmicroSD内の音声を再生します。音声出力は**有線スピーカー**（DFPlayer等、もしくはI2S→アンプ→スピーカー）です。
+
+---
+
+# 目次
+
+1. 構成図（簡略）
+2. 推奨機材（1オブジェクト分）
+3. 配線イメージ
+4. ESP32（Arduino）側 — 実装（BLE GATTサーバ + DFPlayer制御）
+5. PC側（Python） — 実装（BLEスキャン＋RSSI閾値→PLAY送信＋映像再生）
+6. キャリブレーションと運用上の注意
+7. デプロイ時チェックリスト
+
+---
+
+# 1. 構成図（簡略）
+
+```
+[ユーザーが持つオブジェクト]
+  ├─ ESP32 (BLEペリフェラル / GATTサーバ)
+  ├─ DFPlayer Mini or I2S DAC + microSD（音声保存）
+  ├─ 小型アンプ（必要なら） → 有線スピーカー
+  └─ バッテリ（モバイルバッテリ等）
+
+[各設置PC]
+  ├─ USB BLEドングル（または内蔵BLE）
+  ├─ Python (bleak) スクリプト：常時スキャン、RSSI判定、GATT接続→PLAY書き込み
+  └─ 映像再生ソフト（VLC等）
+```
+
+---
+
+# 2. 推奨機材（1オブジェクト分）
+
+* ESP32-DevKitC（または M5Stack 系） ×1
+* DFPlayer Mini（MP3プレーヤーモジュール） ×1
+  → microSDにMP3を入れて再生（簡単実装）
+  ※ 代替：ESP32 + I2S DAC（ES8388 / MAX98357A）＋SDカードライブラリ（実装はやや複雑）
+* microSDカード（音声ファイル）
+* 小型アンプ（PAM8403 等）※DFPlayerにアンプ内蔵でない場合
+* スピーカー（8Ω 1–3W 程度）
+* バッテリ：モバイルバッテリ or Li-ion（ESP32 + DFPlayerで数時間〜、容量設計要）
+* USB BLEドングル（PC側。WindowsやLinuxで動作確認済みのもの）
+* PC：Windows / Linux / macOS（Python環境、VLC等）
+
+---
+
+# 3. 配線イメージ（オブジェクト側）
+
+* ESP32 UART1 (TX/RX) → DFPlayer RX/TX
+  （例：ESP32 TX1(17) → DFPlayer RX, ESP32 RX1(16) ← DFPlayer TX）
+* DFPlayer VCC → 5V（安定化電源／バッテリ）
+* DFPlayer GND → ESP32 GND → バッテリGND
+* DFPlayer SPK+/SPK- → 小型アンプ入力 → スピーカー（もしくはDFPlayerの出力をアンプへ）
+* DFPlayer BUSY（再生中ピン） → ESP32 GPIO（再生中フラグ取得）
+* （オプション）再生トリガ用のボタンをESP32のGPIOに接続
+
+---
+
+# 4. ESP32（Arduino）側 — コード（BLE GATTサーバ + DFPlayer制御）
+
+**前提ライブラリ**
+
+* ESP32 ボード定義（Arduino IDE / PlatformIO）
+* DFRobotDFPlayerMini ライブラリ
+
+```cpp
+// ESP32 + DFPlayer Mini のサンプル
+// 概要：BLE GATT サーバを立て、特性に "PLAY" が書き込まれたら DFPlayer のトラック1を再生。
+// 注意：ピン番号は開発ボードや配線に合わせて調整してください。
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <HardwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+#define SERVICE_UUID        "0000feed-0000-1000-8000-00805f9b34fb"
+#define CHAR_CMD_UUID       "0000beef-0000-1000-8000-00805f9b34fb"
+
+// DFPlayer 用シリアル（UART1 を使用する例）
+HardwareSerial SerialDF(1); // UART1: TX=17, RX=16 (例)
+DFRobotDFPlayerMini dfplayer;
+
+BLECharacteristic *pCmdChar;
+volatile bool isPlaying = false;
+unsigned long lastPlayedAt = 0;
+const unsigned long COOLDOWN_MS = 15000; // 再トリガーを防ぐクールダウン（ms）
+
+// BUSYピンで再生状態を取得する場合のピン番号（DFPlayerのBUSY→ESP32 GPIO）
+const int DFPLAYER_BUSY_PIN = 4;
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    std::string val = pCharacteristic->getValue();
+    if(val.size() > 0) {
+      String cmd = String((char*)val.c_str());
+      if(cmd == "PLAY") {
+        unsigned long now = millis();
+        if(isPlaying) return;                 // 再生中は無視
+        if(now - lastPlayedAt < COOLDOWN_MS) return; // クールダウン中は無視
+        lastPlayedAt = now;
+        // DFPlayer でトラック1を再生（microSDの 001.mp3）
+        dfplayer.play(1);
+        isPlaying = true;
+      }
+    }
+  }
+};
+
+void setupDFPlayer() {
+  SerialDF.begin(9600, SERIAL_8N1, 16, 17); // RX=16, TX=17 の例
+  delay(200);
+  if (!dfplayer.begin(SerialDF)) {
+    Serial.println("DFPlayer init failed!");
+    while(true) { delay(1000); } // 初期化失敗なら停止（実運用ではリトライ設計）
+  }
+  dfplayer.volume(22); // 0-30
+  pinMode(DFPLAYER_BUSY_PIN, INPUT_PULLUP); // BUSYピンがある場合
+}
+
+void setup() {
+  Serial.begin(115200);
+  setupDFPlayer();
+
+  // BLE初期化
+  BLEDevice::init("OBJ_001"); // 各オブジェクトでユニークな名前にする
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCmdChar = pService->createCharacteristic(CHAR_CMD_UUID,
+                                            BLECharacteristic::PROPERTY_WRITE);
+  pCmdChar->setCallbacks(new MyCallbacks());
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+  Serial.println("BLE advertising started.");
+}
+
+void loop() {
+  // BUSYピンで再生終了を検知してフラグを戻す
+  static int lastBusyState = HIGH;
+  int busy = digitalRead(DFPLAYER_BUSY_PIN);
+  if (busy == LOW && lastBusyState == HIGH) {
+    // 再生が始まった（BUSY: LOWで再生中の機種が多いので確認）
+    Serial.println("DFPlayer BUSY: playing");
+  } else if (busy == HIGH && lastBusyState == LOW) {
+    // 再生が終わった
+    Serial.println("DFPlayer BUSY: stopped");
+    isPlaying = false;
+  }
+  lastBusyState = busy;
+
+  delay(50);
+}
+```
+
+**備考**
+
+* DFPlayer の BUSY ピンは再生中/停止の判別に使えるので、確実な再生状態管理に推奨します。
+* DFPlayer ではトラック番号（001.mp3 等）で管理するのが楽です。
+* 電源デカップリング（コンデンサ）やGNDループ対策をして、ノイズを減らしてください。
+
+---
+
+# 5. PC側（Python） — コード（bleak + VLC）
+
+**前提**
+
+* Python 3.8+
+* `pip install bleak python-vlc`
+
+```python
+# pc_trigger.py
+# 概要：BLEスキャンで OBJ_ で始まるデバイスを見つけ、RSSI閾値を超えたら接続して
+#        GATT特性に 'PLAY' を書き込み、VLCで動画を再生する。
+# 注意：RSSI閾値は現地でキャリブレーションが必要です。
+
+import asyncio
+from bleak import BleakScanner, BleakClient
+import subprocess
+import time
+
+# 設定項目（現地で要調整）
+TARGET_NAME_PREFIX = "OBJ_"        # ESP32のadvertise名のプレフィックス
+CMD_CHAR_UUID = "0000beef-0000-1000-8000-00805f9b34fb"
+RSSI_THRESHOLD = -60               # 例: -60 (近い)。値は要調整（大きい数値=より近い）
+DEBOUNCE_SEC = 12                  # 同一デバイス再トリガー防止（秒）
+VIDEO_PATH = r"C:\videos\demo.mp4" # 再生する動画のパス（Windows例）
+VLC_CMD = ["vlc", "--play-and-exit", VIDEO_PATH]  # VLCコマンド（環境に合わせて）
+
+# 実行記録（アドレス→最終トリガー時刻）
+last_triggered = {}
+
+async def trigger_device(address):
+    try:
+        async with BleakClient(address, timeout=5.0) as client:
+            # 書き込みで 'PLAY' を送る（ASCII）
+            await client.write_gatt_char(CMD_CHAR_UUID, b'PLAY')
+            # 映像再生（非ブロッキング）
+            subprocess.Popen(VLC_CMD)
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Triggered {address}")
+    except Exception as e:
+        print("Trigger failed:", e)
+
+async def scan_loop():
+    scanner = BleakScanner()
+    while True:
+        devices = await scanner.discover(timeout=3.0)
+        now = time.time()
+        for d in devices:
+            # 名前フィルタ
+            name = d.name or ""
+            if not name.startswith(TARGET_NAME_PREFIX):
+                continue
+            # RSSIチェック
+            rssi = d.rssi
+            if rssi is None:
+                continue
+            # デバウンス（短時間に連続トリガーしない）
+            addr = d.address
+            last = last_triggered.get(addr, 0)
+            if now - last < DEBOUNCE_SEC:
+                continue
+            if rssi >= RSSI_THRESHOLD:
+                # トリガーを非同期で実施（接続処理で短時間待ちになるため）
+                last_triggered[addr] = now
+                asyncio.create_task(trigger_device(addr))
+        await asyncio.sleep(0.5)
+
+if __name__ == "__main__":
+    asyncio.run(scan_loop())
+```
+
+**備考**
+
+* `RSSI_THRESHOLD` の符号と比較は環境により調整してください（上のコードは「RSSI が閾値以上（値が大きい＝近い）」でトリガー）。
+* Windowsで`vlc`コマンドがPATHに無い場合はフルパス指定にしてください。Linux/macOSも同様。
+* `DEBOUNCE_SEC` は現場の要件に合わせて長めに（10〜30秒程度）設定すると良いです。
+
+---
+
+# 6. キャリブレーションと運用上の注意
+
+* **RSSIは環境依存**：金属、壁、人体、角度で大きく変動するため、現地で必ず測定して閾値を決めること。
+
+  * 推奨法：オブジェクトを想定位置（再生ポイント）に置き、その位置でPCが取得するRSSIを30～50サンプル取り、平均を閾値設定（さらにヒステリシスを入れる）。
+* **ヒステリシス**：入る閾値と出る閾値を分けてチャタリングを防ぐ（例：入る -60、出る -70）。
+* **先着制/競合**：オブジェクトが複数PCの境界領域に入った場合、**先にGATT接続できてPLAYを書き込めたPC**がトリガーされる運用が簡単。必要ならゾーン割り当てで論理的に分離する。
+* **再生中の重複排除**：ESP32側で再生中は再トリガーを無視（BUSYピンで判別）すること。
+* **電源管理**：バッテリ残量監視や予備充電スケジュールを作る（展示運用では重要）。
+* **セキュリティ**：BLEは暗号化していない場合、野良端末の誤トリガーの可能性がある。必要なら接続時に簡易認証（UIDチェック）を導入する。
+* **ログ**：PC側はトリガー時刻・デバイスアドレス・RSSIをログに残すとトラブル解析が楽。
+
+---
+
+# 7. デプロイ時チェックリスト
+
+* [ ] 各オブジェクトにユニークなBLE名（例：OBJ_001, OBJ_002）を設定しているか
+* [ ] microSDに再生用ファイル（001.mp3 等）を配置しているか（フォーマット確認）
+* [ ] DFPlayerのBUSYピンをESP32に接続して再生状態を取得できるか
+* [ ] PCのBLEドングルが安定してスキャンできるか（ドライバ/権限）
+* [ ] 現地でRSSIキャリブレーションを実施し閾値を決めたか（複数サンプル）
+* [ ] DEBOUNCE/COOLDOWN 値を実使用に合わせて調整したか（例：10〜30秒）
+* [ ] 音量調整、ノイズ対策（電源デカップリング）を実施したか
+* [ ] 複数PCでの競合ルール（先着/ゾーン割り当て）を決め、運用担当に周知したか
+
+---
+
+# 付録：よくある問題と対策
+
+* **トリガーが頻繁にチラつく（チャタリング）**
+  → RSSIの移動平均 + ヒステリシス + デバウンス（時間判定）を導入。
+* **音が割れる・ノイズがある**
+  → 電源のデカップリング（コンデンサ）を入れる。GNDを正しくまとめる。アンプのアース回りを確認。
+* **複数PCから同時にアクセスされ再生競合が起きる**
+  → ESP32で「再生中は書き込みを無視」するか、PC側でゾーン分けを行う。
+* **バッテリがすぐ切れる**
+  → 消費電力を測り、バッテリ容量を増やす。ESP32のビーコン出力を間欠にして省電力化も検討。
+
+---
+
+以上が **そのままコピペで使える Markdown ドキュメント** です。
+必要なら、このMarkdownを基に **PDF化用の整形（見出しレベルや図入り）** や **複数オブジェクトの管理表（CSV）**、あるいは **ESP32をI2S＋SDで再生する実装（DFPlayer無しで高音質）** を追加で作成します。どれを先に出しますか？
