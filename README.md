@@ -254,7 +254,210 @@ if __name__ == "__main__":
 
 ---
 
-# 6. キャリブレーションと運用上の注意
+# 6. PC側（C#）— BLE距離判定＋GATT書き込み＋映像再生（完全版）
+
+## 概要
+BLEでArduinoを検出し、近距離に入ると映像＋音声再生を開始。  
+離れると自動停止します。
+
+## 必要ライブラリ
+- .NET 6 以上
+- NuGetパッケージ：
+  - `Windows.Devices.Bluetooth`
+  - `Windows.Devices.Enumeration`
+  - `Vlc.DotNet.Forms`
+
+## コード例
+
+```csharp
+using System;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Windows.Devices.Bluetooth;
+using Windows.Devices.Bluetooth.Advertisement;
+using Windows.Devices.Bluetooth.GenericAttributeProfile;
+using Windows.Storage.Streams;
+using Vlc.DotNet.Forms;
+
+namespace BLE_VideoSync
+{
+    public class Program : Form
+    {
+        private BluetoothLEAdvertisementWatcher watcher;
+        private VlcControl vlc;
+        private DateTime lastSeen = DateTime.MinValue;
+        private DateTime lastTriggerTime = DateTime.MinValue;
+        private bool isNear = false;
+        private bool isPlaying = false;
+        private BluetoothLEDevice currentDevice;
+        private GattCharacteristic targetCharacteristic;
+        private Timer checkTimer;
+
+        // Arduino側と一致させるUUID
+        private const string TargetServiceUuid = "0000fff0-0000-1000-8000-00805f9b34fb";
+        private const string TargetCharacteristicUuid = "0000fff1-0000-1000-8000-00805f9b34fb";
+
+        // パラメータ設定
+        private const int NearThreshold = -70; // RSSI閾値
+        private const int LostTimeout = 4000;  // 離脱とみなす時間（ms）
+        private const int DebounceSec = 5;     // 再トリガー防止時間（秒）
+
+        [STAThread]
+        public static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.Run(new Program());
+        }
+
+        public Program()
+        {
+            Text = "BLE距離判定プレーヤー";
+            Width = 1280;
+            Height = 720;
+
+            // VLC初期化
+            vlc = new VlcControl();
+            vlc.Dock = DockStyle.Fill;
+            vlc.VlcLibDirectory = new System.IO.DirectoryInfo(@"C:\\Program Files\\VideoLAN\\VLC");
+            Controls.Add(vlc);
+
+            // BLEスキャン設定
+            watcher = new BluetoothLEAdvertisementWatcher
+            {
+                ScanningMode = BluetoothLEScanningMode.Active
+            };
+            watcher.Received += OnAdvertisementReceived;
+            watcher.Start();
+
+            // 離脱監視タイマー
+            checkTimer = new Timer();
+            checkTimer.Interval = 1000;
+            checkTimer.Tick += CheckTimer_Tick;
+            checkTimer.Start();
+
+            Console.WriteLine("BLEスキャン開始...");
+        }
+
+        private async void OnAdvertisementReceived(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementReceivedEventArgs args)
+        {
+            var uuids = args.Advertisement.ServiceUuids.Select(u => u.ToString());
+            if (!uuids.Contains(TargetServiceUuid, StringComparer.OrdinalIgnoreCase))
+                return;
+
+            lastSeen = DateTime.Now;
+
+            if (args.RawSignalStrengthInDBm > NearThreshold)
+            {
+                if (!isNear)
+                {
+                    // DEBOUNCE処理：前回から一定時間経過していなければ無視
+                    if ((DateTime.Now - lastTriggerTime).TotalSeconds < DebounceSec)
+                        return;
+
+                    isNear = true;
+                    lastTriggerTime = DateTime.Now;
+
+                    Console.WriteLine($"接近検知: RSSI={args.RawSignalStrengthInDBm} dBm");
+                    await ConnectAndTriggerAsync(args.BluetoothAddress);
+                }
+            }
+        }
+
+        private async Task ConnectAndTriggerAsync(ulong address)
+        {
+            try
+            {
+                currentDevice = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
+                if (currentDevice == null)
+                {
+                    Console.WriteLine("BLE接続失敗");
+                    return;
+                }
+
+                var servicesResult = await currentDevice.GetGattServicesAsync();
+                var service = servicesResult.Services.FirstOrDefault(s => s.Uuid.ToString().Equals(TargetServiceUuid, StringComparison.OrdinalIgnoreCase));
+                if (service == null)
+                {
+                    Console.WriteLine("サービスが見つかりません");
+                    return;
+                }
+
+                var charsResult = await service.GetCharacteristicsAsync();
+                targetCharacteristic = charsResult.Characteristics.FirstOrDefault(c => c.Uuid.ToString().Equals(TargetCharacteristicUuid, StringComparison.OrdinalIgnoreCase));
+                if (targetCharacteristic == null)
+                {
+                    Console.WriteLine("Characteristicが見つかりません");
+                    return;
+                }
+
+                // Arduinoへ再生指示
+                await WriteCommandAsync("PLAY");
+
+                // PCで映像再生
+                PlayVideo("C:\\Videos\\demo.mp4");
+                isPlaying = true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("接続エラー: " + ex.Message);
+            }
+        }
+
+        private async Task WriteCommandAsync(string command)
+        {
+            if (targetCharacteristic == null) return;
+
+            var writer = new DataWriter();
+            writer.WriteString(command);
+            await targetCharacteristic.WriteValueAsync(writer.DetachBuffer());
+            Console.WriteLine($"コマンド送信: {command}");
+        }
+
+        private async void CheckTimer_Tick(object sender, EventArgs e)
+        {
+            if (isNear && (DateTime.Now - lastSeen).TotalMilliseconds > LostTimeout)
+            {
+                Console.WriteLine("デバイス離脱検出");
+                isNear = false;
+
+                await WriteCommandAsync("STOP");
+                StopVideo();
+                isPlaying = false;
+            }
+        }
+
+        private void PlayVideo(string path)
+        {
+            if (!isPlaying)
+            {
+                vlc.Play(new Uri(path));
+                Console.WriteLine("映像再生開始");
+            }
+        }
+
+        private void StopVideo()
+        {
+            if (isPlaying)
+            {
+                vlc.Stop();
+                Console.WriteLine("映像停止");
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            watcher.Stop();
+            checkTimer.Stop();
+            vlc.Dispose();
+            base.OnFormClosing(e);
+        }
+    }
+}
+```
+---
+
+# 7. キャリブレーションと運用上の注意
 
 * **RSSIは環境依存**：金属、壁、人体、角度で大きく変動するため、現地で必ず測定して閾値を決めること。
 
@@ -268,7 +471,7 @@ if __name__ == "__main__":
 
 ---
 
-# 7. デプロイ時チェックリスト
+# 8. デプロイ時チェックリスト
 
 * [ ] 各オブジェクトにユニークなBLE名（例：OBJ_001, OBJ_002）を設定しているか
 * [ ] microSDに再生用ファイル（001.mp3 等）を配置しているか（フォーマット確認）
