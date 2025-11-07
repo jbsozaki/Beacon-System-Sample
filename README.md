@@ -254,7 +254,7 @@ if __name__ == "__main__":
 
 ---
 
-# 6. PC側（C#）— BLE距離判定＋GATT書き込み＋映像再生（完全版）
+# 6. PC側（C#）— Windows.Devices.Bluetooth + VLC
 
 ## 概要
 BLEでArduinoを検出し、近距離に入ると映像＋音声再生を開始。  
